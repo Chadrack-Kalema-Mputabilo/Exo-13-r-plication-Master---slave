@@ -1,0 +1,190 @@
+Voici la procédure pour configurer une architecture de balance des charges avec Nginx comme proxy et une réplication Master-Slave pour MySQL sur AWS. Vous allez établir un VPC avec un sous-réseau public pour le proxy et deux sous-réseaux privés pour les bases de données.
+
+### Étape 1 : Créer un VPC et des sous-réseaux
+
+1. **Accéder à la console VPC** :
+   - Connectez-vous à votre compte AWS et allez à la console VPC.
+
+2. **Créer un VPC** :
+   - Cliquez sur "Create VPC".
+   - Donnez-lui un nom (par exemple, `my-vpc`).
+   - Définissez un bloc CIDR (par exemple, `10.0.0.0/16`).
+   - Cliquez sur "Create".
+
+3. **Créer les sous-réseaux** :
+   - **Sous-réseau public** :
+     - Cliquez sur "Subnets" puis "Create Subnet".
+     - Donnez-lui un nom (par exemple, `public-subnet`), sélectionnez votre VPC, et attribuez un bloc CIDR (par exemple, `10.0.1.0/24`).
+   - **Sous-réseau privé 1** :
+     - Créez un sous-réseau privé (nommez-le `private-subnet-1` avec un bloc CIDR comme `10.0.2.0/24`).
+   - **Sous-réseau privé 2** :
+     - Créez un autre sous-réseau privé (nommez-le `private-subnet-2` avec un bloc CIDR comme `10.0.3.0/24`).
+
+4. **Configurer la passerelle Internet** :
+   - Créez une passerelle Internet et attachez-la à votre VPC.
+   - Sous "Route Tables", modifiez la table de routage pour le sous-réseau public afin d'ajouter une route vers la passerelle Internet.
+
+### Étape 2 : Lancer des instances EC2
+
+1. **Lancer les instances EC2** :
+   - Lancez trois instances EC2 :
+     - **Pour le sous-réseau public** : 
+       - Lancez une instance (nommez-la `proxy-instance`).
+     - **Pour les sous-réseaux privés** : 
+       - Lancez deux instances (nommez-les `mysql-master` et `mysql-slave`).
+
+2. **Configurer les groupes de sécurité** :
+   - **Proxy (public)** : 
+     - Autorisez le trafic HTTP (port 80) et SSH (port 22).
+   - **MySQL (privés)** : 
+     - Autorisez le trafic MySQL (port 3306) entre les instances et l'accès depuis l'instance proxy.
+
+### Étape 3 : Installer MySQL sur les instances privées
+
+1. **Se connecter aux instances MySQL** et installer MySQL :
+
+   ```bash
+   ssh -i "your-key.pem" ec2-user@<mysql-master-public-ip>
+   ```
+
+   Installez MySQL :
+
+   ```bash
+   sudo yum update -y
+   sudo yum install mysql-server -y
+   ```
+
+   Démarrez MySQL :
+
+   ```bash
+   sudo systemctl start mysqld
+   sudo systemctl enable mysqld
+   ```
+
+2. **Configurer MySQL pour la réplication** :
+   - Récupérez le mot de passe temporaire de l'utilisateur root :
+
+     ```bash
+     sudo cat /var/log/mysqld.log | grep 'temporary password'
+     ```
+
+   - Connectez-vous à MySQL :
+
+     ```bash
+     mysql -u root -p
+     ```
+
+   - Changez le mot de passe root :
+
+     ```sql
+     ALTER USER 'root'@'localhost' IDENTIFIED BY 'NewPassword123!';
+     ```
+
+   - Activez la réplication sur `mysql-master` :
+
+     ```sql
+     SET GLOBAL server_id = 1;
+     ```
+
+   - Notez la position de l'offset du journal binaire :
+
+     ```sql
+     SHOW MASTER STATUS;
+     ```
+
+3. **Configurer le slave** :
+   - Connectez-vous à `mysql-slave` :
+
+     ```bash
+     ssh -i "your-key.pem" ec2-user@<mysql-slave-public-ip>
+     ```
+
+   - Installez MySQL de la même manière que pour le master.
+   - Configurez le slave :
+
+     ```sql
+     SET GLOBAL server_id = 2;
+     CHANGE MASTER TO
+       MASTER_HOST='mysql-master-private-ip',
+       MASTER_USER='replicator',
+       MASTER_PASSWORD='replicator_password',
+       MASTER_LOG_FILE='mysql-bin.000001',
+       MASTER_LOG_POS=position;
+     START SLAVE;
+     ```
+
+4. **Créer un utilisateur pour la réplication** :
+   - Sur `mysql-master`, exécutez :
+
+     ```sql
+     CREATE USER 'replicator'@'%' IDENTIFIED BY 'replicator_password';
+     GRANT REPLICATION SLAVE ON *.* TO 'replicator'@'%';
+     FLUSH PRIVILEGES;
+     ```
+
+### Étape 4 : Installer Nginx sur l'instance Proxy
+
+1. **Se connecter à l'instance Proxy** :
+
+   ```bash
+   ssh -i "your-key.pem" ec2-user@<proxy-instance-public-ip>
+   ```
+
+2. **Installer Nginx** :
+
+   ```bash
+   sudo yum update -y
+   sudo amazon-linux-extras install nginx1 -y
+   ```
+
+3. **Configurer Nginx pour la balance de charge** :
+
+   Modifiez le fichier de configuration :
+
+   ```bash
+   sudo nano /etc/nginx/nginx.conf
+   ```
+
+   Ajoutez la configuration suivante dans le bloc `http` :
+
+   ```nginx
+   http {
+       upstream mysql_servers {
+           server mysql-master-private-ip:3306;
+           server mysql-slave-private-ip:3306;
+       }
+
+       server {
+           listen 80;
+
+           location / {
+               proxy_pass http://mysql_servers;
+           }
+       }
+   }
+   ```
+
+4. **Démarrer Nginx** :
+
+   ```bash
+   sudo systemctl start nginx
+   sudo systemctl enable nginx
+   ```
+
+### Étape 5 : Tester la configuration
+
+1. **Vérifier la connexion à MySQL** via l'instance Proxy :
+
+   Utilisez un client MySQL pour vous connecter à l'instance Proxy et exécuter des requêtes :
+
+   ```bash
+   mysql -h <proxy-instance-public-ip> -u root -p
+   ```
+
+2. **Tester la réplication** :
+
+   - Créez une base de données ou une table sur `mysql-master` et vérifiez qu'elle est répliquée sur `mysql-slave`.
+
+### Résumé
+
+Vous avez maintenant mis en place une architecture de balance des charges avec Nginx sur AWS, utilisant des instances EC2 avec MySQL en réplication Master-Slave. L'instance Proxy gère les requêtes entrantes et les distribue aux bases de données MySQL, assurant une haute disponibilité et une répartition de la charge.
